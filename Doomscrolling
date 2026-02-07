@@ -1,0 +1,174 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+from ultralytics import YOLO
+import os
+import time
+import pygame
+
+COOLDOWN_SECONDS = 0.7
+
+# Check if laser hits the phone box
+def check_laser_hit(line_start, line_end, box):
+    if box is None:
+        return False
+    
+    bx1, by1, bx2, by2 = box
+    lx2, ly2 = line_end
+    
+    # Check if laser tip is inside the phone box
+    return (bx1 < lx2 < bx2) and (by1 < ly2 < by2)
+
+# Load models
+model = YOLO('yolov8s.pt')
+mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# 3D face model points (nose, chin, left eye, right eye, left mouth, right mouth)
+object_points = np.array([
+    [0, 0, 0],
+    [0, -330, -65],
+    [-225, 170, -135],
+    [225, 170, -135],
+    [-150, -150, -125],
+    [150, -150, -125]
+], dtype=np.float32)
+
+FACE_INDICES = [1, 152, 226, 446, 57, 287]
+
+# Open webcam
+cap = cv2.VideoCapture(0)
+
+# Load punishment image and audio
+PUNISH_IMAGE_PATH = "punishment.jpg"
+PUNISH_AUDIO_PATH = "punishment.mp3"
+
+punish_img = None
+if os.path.exists(PUNISH_IMAGE_PATH):
+    punish_img = cv2.imread(PUNISH_IMAGE_PATH)
+    punish_img = cv2.resize(punish_img, (400, 300))
+else:
+    print(f"Warning: Image not found: {PUNISH_IMAGE_PATH}")
+
+# Load audio
+pygame.mixer.init()
+audio_loaded = False
+if os.path.exists(PUNISH_AUDIO_PATH):
+    try:
+        pygame.mixer.music.load(PUNISH_AUDIO_PATH)
+        audio_loaded = True
+    except Exception as e:
+        print(f"Warning: Audio load failed: {e}")
+else:
+    print(f"Warning: Audio not found: {PUNISH_AUDIO_PATH}")
+
+# State tracking
+alarm_active = False
+stop_time = 0
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
+        break
+
+    # Mirror the camera feed
+    frame = cv2.flip(frame, 1)
+    h, w, c = frame.shape
+
+    # Convert to RGB for face detection
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # Detect phone
+    phone_box = None
+    results = model(frame, stream=True, verbose=False)
+
+    for r in results:
+        for box in r.boxes:
+            # Class 67 is cell phone
+            if int(box.cls[0]) == 67 and float(box.conf[0]) > 0.2:
+                phone_box = list(map(int, box.xyxy[0]))
+                cv2.rectangle(frame, (phone_box[0], phone_box[1]), (phone_box[2], phone_box[3]), (0, 0, 255), 2)
+                cv2.putText(frame, "PHONE", (phone_box[0], phone_box[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+    # Detect face and calculate laser pointer
+    results = mp_face_mesh.process(rgb_frame)
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
+            # Get face points for pose estimation
+            image_points = []
+            for i in FACE_INDICES:
+                x = int(face_landmarks.landmark[i].x * w)
+                y = int(face_landmarks.landmark[i].y * h)
+                image_points.append((x, y))
+            
+            image_points = np.array(image_points, dtype=np.float32)
+            
+            # Set up camera matrix for 3D calculations
+            focal_length = 1 * w
+            cam_matrix = np.array([
+                [focal_length, 0, w / 2],
+                [0, focal_length, h / 2],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            
+            dist_coeffs = np.zeros((4, 1))
+            
+            # Calculate head pose and laser direction
+            success, rvec, tvec = cv2.solvePnP(object_points, image_points, cam_matrix, dist_coeffs)
+            
+            if success:
+                # Project laser pointer in 3D space
+                laser_3d = np.array([[0, 0, 700.0]], dtype=np.float32)
+                end_point_2d, _ = cv2.projectPoints(laser_3d, rvec, tvec, cam_matrix, dist_coeffs)
+                
+                # Get laser line endpoints
+                p1 = (int(image_points[0][0]), int(image_points[0][1]))
+                p2 = (int(end_point_2d[0][0][0]), int(end_point_2d[0][0][1]))
+                
+                # Check if laser hits phone
+                hit = check_laser_hit(p1, p2, phone_box)
+                
+                # Cooldown system to prevent flickering
+                current_time = time.time()
+                
+                if hit:
+                    stop_time = current_time + COOLDOWN_SECONDS
+                    if not alarm_active:
+                        alarm_active = True
+                
+                should_show_alarm = (current_time < stop_time)
+                
+                if should_show_alarm:
+                    # Show punishment
+                    if punish_img is not None:
+                        cv2.imshow("PUNISHMENT", punish_img)
+                    
+                    # Play audio
+                    if audio_loaded and not pygame.mixer.music.get_busy():
+                        pygame.mixer.music.play(-1)
+                    
+                    # Draw warning on main screen
+                    cv2.putText(frame, "TARGET LOCKED!", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                else:
+                    # Stop punishment when cooldown expires
+                    if alarm_active:
+                        alarm_active = False
+                        pygame.mixer.music.stop()
+                        try:
+                            cv2.destroyWindow("PUNISHMENT")
+                        except:
+                            pass
+
+    # Display main camera feed
+    cv2.imshow('Doom what?', frame)
+
+    if cv2.waitKey(5) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+pygame.mixer.quit()
